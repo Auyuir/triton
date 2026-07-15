@@ -63,10 +63,11 @@ def add_kernel_persistent(x_ptr,  # *Pointer* to first input vector.
                ):
     # There are multiple 'programs' processing different data. We identify which program
     # we are here:
-    worker_start = tl.program_id(0)  # We use a 1D launch grid so axis is 0.
-    worker_step = tl.num_programs(0)  # We use a 1D launch grid so axis is 0.
-    for worker_idx in tl.range(worker_start, n_elements, worker_step):
-        block_start = worker_start + worker_idx * BLOCK_SIZE
+    pid = tl.program_id(0)  # We use a 1D launch grid so axis is 0.
+    num_programs = tl.num_programs(0)  # We use a 1D launch grid so axis is 0.
+    num_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+    for worker_idx in tl.range(pid, num_blocks, num_programs):
+        block_start = worker_idx * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask)
@@ -102,8 +103,6 @@ NUM_SM = properties["multiprocessor_count"]
 NUM_REGS = properties["max_num_regs"]
 SIZE_SMEM = properties["max_shared_mem"]
 WARP_SIZE = properties["warpSize"]
-target = triton.runtime.driver.active.get_current_target()
-kernels = {}
 
 def add_persistent(x: torch.Tensor, y: torch.Tensor):
     # We need to preallocate the output.
@@ -118,7 +117,7 @@ def add_persistent(x: torch.Tensor, y: torch.Tensor):
     occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
     occupancy = min(occupancy, SIZE_SMEM // size_smem)
     num_programs = NUM_SM * occupancy
-    num_programs = min(num_programs, n_elements)
+    num_programs = min(num_programs, triton.cdiv(n_elements, 1024))
 
     kernel[(num_programs, 1, 1)](x, y, output, n_elements, BLOCK_SIZE=1024)
     return output
@@ -131,7 +130,7 @@ size = 98432
 x = torch.rand(size, device=DEVICE)
 y = torch.rand(size, device=DEVICE)
 output_torch = x + y
-output_triton = add(x, y)
+output_triton = add_persistent(x, y)
 print(output_torch)
 print(output_triton)
 print(f'The maximum difference between torch and triton is '
@@ -155,9 +154,9 @@ print(f'The maximum difference between torch and triton is '
         x_vals=[2**i for i in range(12, 28, 1)],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
-        line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
-        line_names=['Triton', 'Torch'],  # Label name for the lines.
-        styles=[('blue', '-'), ('green', '-')],  # Line styles.
+        line_vals=['triton', 'torch', 'triton_persistent'],  # Possible values for `line_arg`.
+        line_names=['Triton', 'Torch', 'Triton Persistent'],  # Label name for the lines.
+        styles=[('blue', '-'), ('green', '-'), ('red', '-')],  # Line styles.
         ylabel='GB/s',  # Label name for the y-axis.
         plot_name='vector-add-performance',  # Name for the plot. Used also as a file name for saving the plot.
         args={},  # Values for function arguments not in `x_names` and `y_name`.
@@ -170,6 +169,8 @@ def benchmark(size, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: x + y, quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y), quantiles=quantiles)
+    if provider == 'triton_persistent':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: add_persistent(x, y), quantiles=quantiles)
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
