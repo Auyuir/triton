@@ -115,7 +115,8 @@ def add_persistent(x: torch.Tensor, y: torch.Tensor):
     n_regs = kernel.n_regs
     size_smem = kernel.metadata.shared
     occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
-    occupancy = min(occupancy, SIZE_SMEM // size_smem)
+    if size_smem > 0:
+        occupancy = min(occupancy, SIZE_SMEM // size_smem)
     num_programs = NUM_SM * occupancy
     num_programs = min(num_programs, triton.cdiv(n_elements, 1024))
 
