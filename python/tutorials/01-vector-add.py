@@ -120,7 +120,7 @@ def add_persistent(x: torch.Tensor, y: torch.Tensor):
     num_programs = NUM_SM * occupancy
     num_programs = min(num_programs, triton.cdiv(n_elements, 1024))
 
-    kernel[(num_programs, 1, 1)](x, y, output, n_elements, BLOCK_SIZE=1024)
+    kernel[(num_programs, 1, 1)](x, y, output, n_elements, 1024)
     return output
 
 # %%
