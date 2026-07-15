@@ -22,6 +22,7 @@ import torch
 
 import triton
 import triton.language as tl
+from triton.runtime import driver
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -53,6 +54,25 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
     # Write x + y back to DRAM.
     tl.store(output_ptr + offsets, output, mask=mask)
 
+@triton.jit
+def add_kernel_persistent(x_ptr,  # *Pointer* to first input vector.
+               y_ptr,  # *Pointer* to second input vector.
+               output_ptr,  # *Pointer* to output vector.
+               n_elements,  # Size of the vector.
+               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
+               ):
+    # There are multiple 'programs' processing different data. We identify which program
+    # we are here:
+    worker_start = tl.program_id(0)  # We use a 1D launch grid so axis is 0.
+    worker_step = tl.num_programs(0)  # We use a 1D launch grid so axis is 0.
+    for worker_idx in tl.range(worker_start, n_elements, worker_step):
+        block_start = worker_start + worker_idx * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(output_ptr + offsets, output, mask=mask)
 
 # %%
 # Let's also declare a helper function to (1) allocate the `z` tensor
@@ -77,6 +97,31 @@ def add(x: torch.Tensor, y: torch.Tensor):
     # running asynchronously at this point.
     return output
 
+properties = driver.active.utils.get_device_properties(DEVICE.index)
+NUM_SM = properties["multiprocessor_count"]
+NUM_REGS = properties["max_num_regs"]
+SIZE_SMEM = properties["max_shared_mem"]
+WARP_SIZE = properties["warpSize"]
+target = triton.runtime.driver.active.get_current_target()
+kernels = {}
+
+def add_persistent(x: torch.Tensor, y: torch.Tensor):
+    # We need to preallocate the output.
+    output = torch.empty_like(x)
+    num_warps = 8
+    assert x.device == DEVICE and y.device == DEVICE and output.device == DEVICE
+    n_elements = output.numel()
+    kernel = add_kernel_persistent.warmup(x, y, output, n_elements, BLOCK_SIZE=1024, num_warps=num_warps, grid=(1, ))
+    kernel._init_handles()
+    n_regs = kernel.n_regs
+    size_smem = kernel.metadata.shared
+    occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
+    occupancy = min(occupancy, SIZE_SMEM // size_smem)
+    num_programs = NUM_SM * occupancy
+    num_programs = min(num_programs, n_elements)
+
+    kernel[(num_programs, 1, 1)](x, y, output, n_elements, BLOCK_SIZE=1024)
+    return output
 
 # %%
 # We can now use the above function to compute the element-wise sum of two `torch.tensor` objects and test its correctness:
